@@ -1039,36 +1039,40 @@ local function bone_world_position(ent, bone)
     return ZERO_VECTOR
 end
 
--- T-pose reference correction --------------------------------------------------
+-- Reference arm-pose correction ------------------------------------------------
 -- Motion rows are rotation DELTAS applied on top of the model's REFERENCE pose
--- and are tuned against the standard ValveBiped A-pose reference (upper arms
--- ~37.4° below horizontal — measured from the SCMI reference skeleton the
--- supported models compile against). A rare model whose reference sequence is
--- a T-pose (arms straight out) therefore plays every frame with the upper
--- arms raised by the difference (~ -pi/4). Those models are detected from the
--- posed reference skeleton (upper-arm-to-forearm direction nearly horizontal)
--- and the upper arms' DESIRED orientation is pre-rotated down to the standard
--- inclination. The manipulation is still computed against the model's real
+-- and are tuned against the standard ValveBiped A-pose reference: upper arms
+-- 37.42° below horizontal (measured from the SCMI reference skeleton the
+-- supported models compile against). ANY model whose reference holds the arms
+-- at a different inclination plays every frame offset by the difference — a
+-- T-pose (NewFlan: 3.1° ⇒ arms ~34° high, the original -pi/4 report) or a
+-- drooped A-pose (vesna: 55.3° ⇒ arms ~18° low). The posed reference skeleton
+-- is measured and each upper arm's DESIRED orientation is re-inclined to the
+-- standard angle. Only the INCLINATION is corrected, never the azimuth:
+-- measured correct models legitimately differ by ±4° in forward sweep
+-- (furina +88.5° vs alf +83.8°), so there is no azimuth ground truth. The
+-- dead-band keeps genuinely standard models on the exact untouched code path
+-- (furina 38.44° and alf 35.28° both sit inside it; the SCMI reference is
+-- 37.42°). The manipulation is still computed against the model's real
 -- baseline, so the fast path's self-verification is untouched, and the whole
 -- forearm/hand chain inherits the correction through its parent's world
--- orientation. A-pose models measure far above the threshold and take the
--- exact untouched code path.
-local TPOSE_STANDARD_ARM_DOWN_DEG = 37.42
-local TPOSE_ARM_DOWN_MAX_DEG = 20
+-- orientation.
+local ARM_STANDARD_DOWN_DEG = 37.42
+local ARM_CORRECTION_DEADBAND_DEG = 3.5
 
-local TPOSE_ARM_BONES = {
+local ARM_CORRECTION_BONES = {
     { upper = "ValveBiped.Bip01_L_UpperArm", lower = "ValveBiped.Bip01_L_Forearm" },
     { upper = "ValveBiped.Bip01_R_UpperArm", lower = "ValveBiped.Bip01_R_Forearm" },
 }
 
 -- Must run while the entity is posed at its reference sequence with all bone
--- manipulations cleared. Returns nil for A-pose (standard) models.
-local function tpose_arm_corrections(ent)
+-- manipulations cleared. Returns nil for standard-reference models.
+local function arm_reference_corrections(ent)
     if not ent.LookupBone then return nil end
     local corrections = nil
     local entPos = ent:GetPos()
     local entAng = ent:GetAngles()
-    for _, pair in ipairs(TPOSE_ARM_BONES) do
+    for _, pair in ipairs(ARM_CORRECTION_BONES) do
         local upper = ent:LookupBone(pair.upper)
         local lower = ent:LookupBone(pair.lower)
         if upper and lower then
@@ -1078,12 +1082,12 @@ local function tpose_arm_corrections(ent)
             if dir:LengthSqr() > 0.25 then
                 dir:Normalize()
                 local downDeg = math.deg(math.asin(math.Clamp(-dir.z, -1, 1)))
-                if downDeg < TPOSE_ARM_DOWN_MAX_DEG then
+                if math.abs(downDeg - ARM_STANDARD_DOWN_DEG) > ARM_CORRECTION_DEADBAND_DEG then
                     -- Same azimuth, re-inclined to the standard A-pose angle.
                     local horizontal = Vector(dir.x, dir.y, 0)
                     if horizontal:LengthSqr() > 0.000001 then
                         horizontal:Normalize()
-                        local rad = math.rad(TPOSE_STANDARD_ARM_DOWN_DEG)
+                        local rad = math.rad(ARM_STANDARD_DOWN_DEG)
                         local target = horizontal * math.cos(rad) - Vector(0, 0, math.sin(rad))
                         local axis = dir:Cross(target)
                         local matrix = ent.GetBoneMatrix and ent:GetBoneMatrix(upper) or nil
@@ -1092,7 +1096,7 @@ local function tpose_arm_corrections(ent)
                             local degreesCorr = math.deg(math.acos(math.Clamp(dir:Dot(target), -1, 1)))
                             -- Store the correction as a constant BONE-LOCAL
                             -- post-rotation L = ref⁻¹·C·ref (C = the reference-
-                            -- frame rotation that lowers the arm). Applied as
+                            -- frame rotation re-inclining the arm). Applied as
                             -- baseline(t)·L at frame time it rides the animated
                             -- shoulder chain: D(t)·ref·L = D(t)·C·ref — exact
                             -- whatever the torso does. A fixed entity-frame
@@ -1119,19 +1123,19 @@ end
 
 -- Post-rotates a bone's frame baseline by its constant bone-local T-pose
 -- correction. Identity passthrough when the model needed no correction.
-local function tpose_corrected_baseline(baseline, correction)
+local function arm_corrected_baseline(baseline, correction)
     if not correction then return baseline end
     local _, corrected = LocalToWorld(ZERO_VECTOR, correction.localDelta, ZERO_VECTOR, baseline)
     return corrected
 end
 
-local function compute_manip_angle_from_model_axes(ent, bone, degrees, baseline, tposeCorrection)
+local function compute_manip_angle_from_model_axes(ent, bone, degrees, baseline, armCorrection)
     baseline = baseline or bone_baseline_angle(ent, bone)
     -- Desired comes from the (possibly T-pose-corrected) baseline; the manip
     -- delta is against the model's REAL baseline so the engine lands exactly
     -- on desired.
     local desired = rotate_angle_around_sequential_model_axes(
-        tpose_corrected_baseline(baseline, tposeCorrection), ent:GetAngles(), degrees)
+        arm_corrected_baseline(baseline, armCorrection), ent:GetAngles(), degrees)
     local _, localManip = WorldToLocal(ZERO_VECTOR, desired, ZERO_VECTOR, baseline)
     return clean_angle(localManip)
 end
@@ -2439,11 +2443,11 @@ local function fast_skeleton_for_dummy(job, dummy)
         -- Only measure a skeleton that is provably AT its reference pose; a
         -- failed reference pose would measure some mid-animation pose and
         -- could false-trigger on an A-pose model.
-        tposeCorrections = refOk and tpose_arm_corrections(dummy) or nil,
+        armCorrections = refOk and arm_reference_corrections(dummy) or nil,
     }
-    if cache.tposeCorrections then
-        for _, correction in pairs(cache.tposeCorrections) do
-            print(string.format("[MMD VMD] T-pose reference detected on %s: lowering %s by %.1f°.",
+    if cache.armCorrections then
+        for _, correction in pairs(cache.armCorrections) do
+            print(string.format("[MMD VMD] Non-standard reference arm pose on %s: re-inclining %s by %.1f° to the standard A-pose.",
                 model, correction.boneName or "upper arm", correction.degrees))
         end
     end
@@ -2587,9 +2591,9 @@ local function fast_build_frame(job, dummy, rows, flexRows)
                 -- the manip stays a delta against the REAL baseline, so the
                 -- engine lands exactly on desired and self-verification holds.
                 -- Descendants inherit the correction via curWorld.
-                local correction = cache.tposeCorrections and cache.tposeCorrections[bone] or nil
+                local correction = cache.armCorrections and cache.armCorrections[bone] or nil
                 local desired = rotate_angle_around_sequential_model_axes(
-                    tpose_corrected_baseline(baseline, correction), entAngles, degrees)
+                    arm_corrected_baseline(baseline, correction), entAngles, degrees)
                 local _, localManip = WorldToLocal(ZERO_VECTOR, desired, ZERO_VECTOR, baseline)
                 local manip = clean_angle(localManip)
                 curWorld[bone] = desired
@@ -2669,7 +2673,7 @@ local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServe
     referenceInfo = referenceInfo or lookup_reference_sequence_info(target)
     clear_all_bone_manipulations(target)
     -- Reference pose must have taken (see fast_skeleton_for_dummy).
-    local tposeCorrections = refOk and tpose_arm_corrections(target) or nil
+    local armCorrections = refOk and arm_reference_corrections(target) or nil
 
     local pelvisBone = target.LookupBone and target:LookupBone(SOURCE_PELVIS) or nil
     local spineBone = target.LookupBone and target:LookupBone(SOURCE_SPINE) or nil
@@ -2728,7 +2732,7 @@ local function rebuild_debug_preview(rows, flexRows, targetEntIndex, sendToServe
                     row.runtimePosition = true
                 end
                 local baseline = bone_baseline_angle(target, row.bone)
-                local correction = tposeCorrections and tposeCorrections[row.bone] or nil
+                local correction = armCorrections and armCorrections[row.bone] or nil
                 local manip = compute_manip_angle_from_model_axes(target, row.bone, degrees, baseline, correction)
 
                 row.p = manip.p or 0
