@@ -545,6 +545,90 @@ class PreviewWidget(QOpenGLWindow):
             angles[axis] = _clamp_angle(angles[axis], float(link.min_angle[axis]), float(link.max_angle[axis]))
         local[link_index][:3, :3] = _euler_xyz_matrix(angles[0], angles[1], angles[2])
 
+    @staticmethod
+    def _chain_deficit(ik, pose: np.ndarray, bone_world: np.ndarray, target_position: np.ndarray) -> float:
+        """How far the target lies beyond the chain's maximum reach (0 when
+        reachable). A miss up to this deficit is geometry, not solver failure:
+        motions authored for longer-limbed models put IK targets out of reach,
+        and the best any solver (MMD included) can do is a straight limb
+        pointing at the target."""
+        indices = [link.bone_index for link in ik.links]
+        if not indices:
+            return 0.0
+        reach = float(np.linalg.norm(pose[ik.target_index][:3, 3] - bone_world[indices[0]]))
+        for near, far in zip(indices, indices[1:]):
+            reach += float(np.linalg.norm(bone_world[near] - bone_world[far]))
+        span = float(np.linalg.norm(target_position - bone_world[indices[-1]]))
+        if len(indices) == 1:
+            # A single-link chain (toe IK: the ankle aiming the toe) sweeps a
+            # fixed-radius sphere — a target nearer OR farther than the reach
+            # is equally unhittable; only the aim direction is solvable.
+            return abs(span - reach)
+        return max(0.0, span - reach)
+
+    def _solve_two_bone_chain(self, ik, local: np.ndarray, pose: np.ndarray, bone_world: np.ndarray, target_position: np.ndarray) -> bool:
+        """Closed-form solve for the standard MMD leg chain [hinge, free]:
+        law-of-cosines bend at the hinge (knee), then one minimal rotation at
+        the free link (hip) that puts the effector exactly on the target.
+        Returns False when the chain does not match, leaving CCD to handle it."""
+        scene = self.scene_data
+        if not scene or len(ik.links) != 2:
+            return False
+        hinge_link, free_link = ik.links[0], ik.links[1]
+        hinge_axis = self._link_hinge_axis(hinge_link)
+        if hinge_axis is None or self._link_hinge_axis(free_link) is not None or free_link.has_limits:
+            return False
+        knee = hinge_link.bone_index
+        hip = free_link.bone_index
+        effector = ik.target_index
+        if not (0 <= knee < len(scene.bones) and 0 <= hip < len(scene.bones) and 0 <= effector < len(scene.bones)):
+            return False
+
+        upper_len = float(np.linalg.norm(bone_world[knee] - bone_world[hip]))
+        lower_len = float(np.linalg.norm(pose[effector][:3, 3] - bone_world[knee]))
+        span = float(np.linalg.norm(target_position - bone_world[hip]))
+        if upper_len <= 1e-6 or lower_len <= 1e-6:
+            return False
+
+        cos_interior = (upper_len * upper_len + lower_len * lower_len - span * span) / (2.0 * upper_len * lower_len)
+        bend = math.pi - math.acos(max(-1.0, min(1.0, cos_interior)))
+        low = min(float(hinge_link.min_angle[hinge_axis]), float(hinge_link.max_angle[hinge_axis]))
+        high = max(float(hinge_link.min_angle[hinge_axis]), float(hinge_link.max_angle[hinge_axis]))
+        bend_angle = -bend if low < -1e-6 else bend
+        bend_angle = max(low, min(high, bend_angle))
+        axis_vec = np.zeros(3, dtype=np.float64)
+        axis_vec[hinge_axis] = 1.0
+        local[knee][:3, :3] = _axis_angle_matrix(axis_vec, bend_angle)[:3, :3]
+        self._update_subtree(knee, local, pose, bone_world)
+
+        try:
+            inv_hip_pose = np.linalg.inv(pose[hip])
+        except np.linalg.LinAlgError:
+            return False
+        to_effector = (inv_hip_pose @ np.append(pose[effector][:3, 3], 1.0))[:3]
+        to_target = (inv_hip_pose @ np.append(target_position, 1.0))[:3]
+        delta = _rotation_between(to_effector, to_target, 0.0)
+        local[hip][:3, :3] = _orthonormalize_rotation(local[hip][:3, :3] @ delta[:3, :3])
+        self._update_subtree(hip, local, pose, bone_world)
+        return True
+
+    @staticmethod
+    def _link_hinge_axis(link) -> int | None:
+        """The single free rotation axis of an angle-limited IK link (knees:
+        X free in [-pi, 0], Y/Z locked at 0), or None when the link is not a
+        pure hinge. MMD solves limited links as hinges; clamping a general
+        CCD rotation through an euler decomposition instead (the previous
+        behaviour) stalls the chain and leaves feet visibly short of their
+        IK targets on motions with deep knee bends."""
+        if not link.has_limits:
+            return None
+        free = [
+            axis
+            for axis in range(3)
+            if abs(float(link.min_angle[axis])) > 1e-9 or abs(float(link.max_angle[axis])) > 1e-9
+        ]
+        return free[0] if len(free) == 1 else None
+
     def _mirror_deform_bones(self, local: np.ndarray, pose: np.ndarray, bone_world: np.ndarray) -> None:
         scene = self.scene_data
         if not scene or not self._deform_mirror_pairs:
@@ -586,6 +670,55 @@ class PreviewWidget(QOpenGLWindow):
             target_position = pose[ik_bone_index][:3, 3].copy()
             iteration_count = max(1, min(int(ik.iterations or 1), 64))
             max_angle = float(ik.limit_radian or 0.5)
+            # Accumulated hinge angle per limited link (MMD plane solve). The
+            # start value absorbs any FK rotation the motion keyed on the link.
+            hinge_angles: dict[int, float] = {}
+
+            # The standard MMD leg — exactly [knee(hinge), hip(free)] — has a
+            # closed-form solution: triangle bend at the knee, one exact aim
+            # at the hip. CCD on this chain is a tarpit: the straight-leg
+            # configuration is a zero-gradient local minimum (the effector
+            # overshoots THROUGH the target while every projected angle reads
+            # ~0), and with large per-iteration angle limits (this model
+            # ships 2.0 rad) the hip and knee oscillate and can end mid-swing
+            # at the iteration cap. The analytic path is exact, stable, and
+            # preserves the hip's FK twist (minimal-rotation aim), which
+            # decides where the knee points.
+            if self._solve_two_bone_chain(ik, local, pose, bone_world, target_position):
+                final_distance = float(np.linalg.norm(pose[ik.target_index][:3, 3] - target_position))
+                solver_miss = final_distance - self._chain_deficit(ik, pose, bone_world, target_position)
+                if not first_warning and solver_miss > max(0.05, self._scene_extent * 0.015):
+                    first_warning = f'IK "{bone.name}" ended {final_distance:.3f} units from target'
+                continue
+
+            # Analytic hinge seed (law of cosines) for other hinge-bearing
+            # chains: puts them inside the CCD convergence basin instead of
+            # the straight-chain local minimum.
+            for seed_position, link in enumerate(ik.links):
+                seed_axis = self._link_hinge_axis(link)
+                if seed_axis is None or seed_position + 1 >= len(ik.links):
+                    continue
+                link_index = link.bone_index
+                parent_index = ik.links[seed_position + 1].bone_index
+                if not (0 <= link_index < len(scene.bones) and 0 <= parent_index < len(scene.bones)):
+                    continue
+                upper_len = float(np.linalg.norm(bone_world[link_index] - bone_world[parent_index]))
+                lower_len = float(np.linalg.norm(pose[ik.target_index][:3, 3] - bone_world[link_index]))
+                span = float(np.linalg.norm(target_position - bone_world[parent_index]))
+                if upper_len <= 1e-6 or lower_len <= 1e-6:
+                    continue
+                cos_interior = (upper_len * upper_len + lower_len * lower_len - span * span) / (2.0 * upper_len * lower_len)
+                bend = math.pi - math.acos(max(-1.0, min(1.0, cos_interior)))
+                low = min(float(link.min_angle[seed_axis]), float(link.max_angle[seed_axis]))
+                high = max(float(link.min_angle[seed_axis]), float(link.max_angle[seed_axis]))
+                seed = -bend if low < -1e-6 else bend
+                seed = max(low, min(high, seed))
+                axis_vec = np.zeros(3, dtype=np.float64)
+                axis_vec[seed_axis] = 1.0
+                hinge_angles[link_index] = seed
+                local[link_index][:3, :3] = _axis_angle_matrix(axis_vec, seed)[:3, :3]
+                self._update_subtree(link_index, local, pose, bone_world)
+
             for _ in range(iteration_count):
                 moved = False
                 for link in ik.links:
@@ -605,6 +738,46 @@ class PreviewWidget(QOpenGLWindow):
 
                     to_effector = (inv_link_pose @ np.append(effector_position, 1.0))[:3]
                     to_target = (inv_link_pose @ np.append(target_position, 1.0))[:3]
+
+                    hinge_axis = self._link_hinge_axis(link)
+                    if hinge_axis is not None:
+                        # MMD-style plane solve: rotate only about the free
+                        # axis, accumulating the clamped hinge angle.
+                        axis_vec = np.zeros(3, dtype=np.float64)
+                        axis_vec[hinge_axis] = 1.0
+                        ve = to_effector - axis_vec * float(np.dot(to_effector, axis_vec))
+                        vt = to_target - axis_vec * float(np.dot(to_target, axis_vec))
+                        if float(np.linalg.norm(ve)) <= 1e-8 or float(np.linalg.norm(vt)) <= 1e-8:
+                            continue
+                        ve /= np.linalg.norm(ve)
+                        vt /= np.linalg.norm(vt)
+                        theta = math.atan2(
+                            float(np.dot(np.cross(ve, vt), axis_vec)),
+                            float(np.clip(np.dot(ve, vt), -1.0, 1.0)),
+                        )
+                        if max_angle > 0:
+                            theta = max(-max_angle, min(max_angle, theta))
+                        if abs(theta) <= 1e-7:
+                            continue
+                        phi = hinge_angles.get(link_index)
+                        if phi is None:
+                            phi = _matrix_to_euler_xyz(local[link_index][:3, :3])[hinge_axis]
+                        # LINEAR clamp of the accumulated hinge angle — the
+                        # wrap-aware _clamp_angle is for decomposed eulers; on
+                        # an accumulated angle its ±2π candidates can "wrap" a
+                        # large positive swing onto the far boundary and pin a
+                        # knee fully folded at -180°.
+                        low = min(float(link.min_angle[hinge_axis]), float(link.max_angle[hinge_axis]))
+                        high = max(float(link.min_angle[hinge_axis]), float(link.max_angle[hinge_axis]))
+                        new_phi = max(low, min(high, phi + theta))
+                        if abs(new_phi - phi) <= 1e-9 and hinge_angles.get(link_index) is not None:
+                            continue
+                        hinge_angles[link_index] = new_phi
+                        local[link_index][:3, :3] = _axis_angle_matrix(axis_vec, new_phi)[:3, :3]
+                        self._update_subtree(link_index, local, pose, bone_world)
+                        moved = True
+                        continue
+
                     delta = _rotation_between(to_effector, to_target, max_angle)
                     if np.allclose(delta, np.eye(4), atol=1e-7):
                         continue
@@ -620,7 +793,8 @@ class PreviewWidget(QOpenGLWindow):
                     break
 
             final_distance = float(np.linalg.norm(pose[ik.target_index][:3, 3] - target_position))
-            if not first_warning and final_distance > max(0.05, self._scene_extent * 0.015):
+            solver_miss = final_distance - self._chain_deficit(ik, pose, bone_world, target_position)
+            if not first_warning and solver_miss > max(0.05, self._scene_extent * 0.015):
                 first_warning = f'IK "{bone.name}" ended {final_distance:.3f} units from target'
         return active_count, enabled_count, first_warning
 

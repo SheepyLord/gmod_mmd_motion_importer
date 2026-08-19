@@ -11,10 +11,16 @@ param(
     [string]$BlenderZip = "",
     [string]$BlenderVersion = "4.5.10",
     [switch]$NoBundledBlender,
-    # Optional: embed an mmd_tools .zip so a freshly-extracted Blender installs it
-    # offline. When omitted, the bake downloads mmd_tools from extensions.blender.org
-    # on first use (unchanged behaviour).
-    [string]$MmdToolsZip = ""
+    # mmd_tools is REQUIRED in the bundle so a fresh machine bakes fully offline:
+    # a first-run bake that must reach extensions.blender.org fails outright on
+    # machines with broken/expired certificate stores. Resolution order:
+    # -MmdToolsZip / env MMDVMDNPC_MMD_TOOLS_ZIP -> newest vendored
+    # tools\blender_addons\*mmd*tools*.zip -> pinned download from the
+    # extensions API into build\mmd_tools_cache. The build FAILS if none
+    # resolves; pass -NoBundledMmdTools to knowingly build an exe that needs
+    # internet for its first bake.
+    [string]$MmdToolsZip = "",
+    [switch]$NoBundledMmdTools
 )
 
 $ErrorActionPreference = "Stop"
@@ -123,17 +129,45 @@ try {
         Write-Host "Skipping bundled Blender (-NoBundledBlender); the importer will reuse a sibling/system Blender at runtime."
     }
 
-    # Optionally embed an mmd_tools zip for fully-offline first-run baking.
-    $MmdToolsSource = if ($MmdToolsZip) { $MmdToolsZip } elseif ($env:MMDVMDNPC_MMD_TOOLS_ZIP) { $env:MMDVMDNPC_MMD_TOOLS_ZIP } else { "" }
-    if ($MmdToolsSource) {
-        if (Test-Path $MmdToolsSource) {
-            $ResolvedMmd = (Resolve-Path $MmdToolsSource).Path
-            Write-Host "Embedding mmd_tools archive: $ResolvedMmd"
-            $ExtraArgs += @("--add-data", "$ResolvedMmd;blender_addons")
+    # Embed an mmd_tools zip for fully-offline first-run baking. Mandatory
+    # unless -NoBundledMmdTools: without it the exe depends on internet (and a
+    # working certificate store) for its very first bake on a fresh machine.
+    if (-not $NoBundledMmdTools) {
+        $MmdToolsSource = if ($MmdToolsZip) { $MmdToolsZip } elseif ($env:MMDVMDNPC_MMD_TOOLS_ZIP) { $env:MMDVMDNPC_MMD_TOOLS_ZIP } else { "" }
+        if ($MmdToolsSource -and -not (Test-Path $MmdToolsSource)) {
+            throw "mmd_tools zip not found: $MmdToolsSource"
         }
-        else {
-            Write-Host "WARNING: mmd_tools zip not found, skipping: $MmdToolsSource"
+        if (-not $MmdToolsSource) {
+            $Vendored = Get-ChildItem (Join-Path $Root "tools\blender_addons") -Filter "*mmd*tools*.zip" -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending | Select-Object -First 1
+            if ($Vendored) { $MmdToolsSource = $Vendored.FullName }
         }
+        if (-not $MmdToolsSource) {
+            $MmdCacheDir = Join-Path $Root "build\mmd_tools_cache"
+            New-Item -ItemType Directory -Force $MmdCacheDir | Out-Null
+            Write-Host "No vendored mmd_tools zip; downloading the pinned extension for Blender $BlenderVersion ..."
+            try {
+                $Api = Invoke-RestMethod -Uri "https://extensions.blender.org/api/v1/extensions/?blender_version=$BlenderVersion" -Headers @{ "User-Agent" = "mmd-vmd-importer-build" } -TimeoutSec 90
+                $Mmd = $Api.data | Where-Object { $_.id -eq "mmd_tools" } | Select-Object -First 1
+                if ($Mmd) {
+                    $MmdTarget = Join-Path $MmdCacheDir "mmd_tools-$($Mmd.version).zip"
+                    Invoke-WebRequest -Uri $Mmd.archive_url -OutFile $MmdTarget -Headers @{ "User-Agent" = "mmd-vmd-importer-build" } -TimeoutSec 300
+                    if ((Test-Path $MmdTarget) -and (Get-Item $MmdTarget).Length -gt 100KB) { $MmdToolsSource = $MmdTarget }
+                }
+            }
+            catch {
+                Write-Host "mmd_tools download failed: $_"
+            }
+        }
+        if (-not $MmdToolsSource -or -not (Test-Path $MmdToolsSource)) {
+            throw "Could not resolve an mmd_tools zip to embed; the exe would need internet on its first bake. Vendor one at tools\blender_addons\, pass -MmdToolsZip, or pass -NoBundledMmdTools to build without it."
+        }
+        $ResolvedMmd = (Resolve-Path $MmdToolsSource).Path
+        Write-Host "Embedding mmd_tools archive: $ResolvedMmd"
+        $ExtraArgs += @("--add-data", "$ResolvedMmd;blender_addons")
+    }
+    else {
+        Write-Host "Skipping bundled mmd_tools (-NoBundledMmdTools); first-run bakes will require internet."
     }
 
     & $Python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('PyInstaller') else 1)" > $null
